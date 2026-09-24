@@ -1,110 +1,370 @@
 # DeFi Portfolio Tracker
 
-A full-stack Web3 project built around a **Java backend**, not just Solidity + React — the angle that
-differentiates a Java/fullstack background from the flood of JS-only Web3 portfolios.
+A full-stack Web3 project built with **Java, Spring Boot, Web3j, Solidity, and a small HTML/JS dashboard**.
 
-**What it does:** reads a wallet's ERC-20 token balance and staking positions directly from an Ethereum
-testnet via [Web3j](https://github.com/web3j/web3j) (Java's equivalent of ethers.js), caches snapshots in
-Postgres/H2, and serves them over a REST API with a small dashboard on top.
+The idea was simple: instead of having the frontend talk directly to an Ethereum RPC for everything, I wanted to build a backend that reads blockchain data, stores snapshots, and exposes it through a REST API.
 
+The project tracks:
+
+* ERC-20 token balances
+* Staking positions
+* Pending staking rewards
+* Lock periods and APY
+* Historical balance/staking snapshots
+
+The contracts run on the **Ethereum Sepolia testnet**.
+
+## Project Structure
+
+```text
+contracts/
+    Solidity contracts, deployment scripts, and tests
+
+backend/
+    Spring Boot + Web3j backend
+    REST API
+    Database/cache
+    Static HTML/JS dashboard
 ```
-contracts/   Solidity: TrackerToken (ERC-20) + Staking (tiered-APY staking pool). Hardhat + tests.
-backend/     Spring Boot + Web3j: reads on-chain state, caches it, exposes REST endpoints.
-             Static dashboard lives at backend/src/main/resources/static/index.html.
+
+## How It Works
+
+The flow is roughly:
+
+```text
+Ethereum / Sepolia
+        ↓
+     Web3j
+        ↓
+ Spring Boot Backend
+        ↓
+   H2 / PostgreSQL
+        ↓
+     REST API
+        ↓
+ HTML/JS Dashboard
 ```
 
-## Why this project (and not just "another staking dApp")
+The backend periodically reads the required data from the blockchain and stores a snapshot in the database.
 
-A staking contract with a React frontend is common. Putting a **real backend service** in front of chain
-data — one that caches state, polls on a schedule, and serves a clean API instead of hitting an RPC
-node from the browser on every click — is the pattern real protocol/wallet/exchange backend teams
-actually hire for. It's also a legitimate way to make a Java background an asset instead of something to
-work around.
+The dashboard then reads from the API instead of making blockchain calls directly.
 
-## 1. Contracts
+This keeps the frontend simple and gives the project a more realistic backend architecture.
+
+---
+
+# 1. Smart Contracts
+
+The `contracts` directory contains two Solidity contracts:
+
+### TrackerToken
+
+A basic ERC-20 token based on OpenZeppelin.
+
+* Initial supply: **1,000,000 tokens**
+* Used as the token for the staking contract
+
+### Staking
+
+A simple tiered staking contract with three lock periods:
+
+| Lock Period | APY |
+| ----------- | --: |
+| 30 days     |  5% |
+| 90 days     | 12% |
+| 180 days    | 25% |
+
+There is also a **10% penalty on early withdrawal**.
+
+The contract uses OpenZeppelin's `ReentrancyGuard` for state-changing functions.
+
+The tests cover:
+
+* Reward calculation over time
+* Early withdrawal penalty
+* Full withdrawal after the lock period
+* Invalid lock tier
+* Double withdrawal
+
+## Running the Contracts
 
 ```bash
 cd contracts
+
 npm install
-cp .env.example .env        # fill in SEPOLIA_RPC_URL + PRIVATE_KEY (see below)
+
+cp .env.example .env
+```
+
+Add your Sepolia RPC URL and a test wallet's private key to `.env`.
+
+Then:
+
+```bash
+npx hardhat compile
+npx hardhat test
+```
+
+To deploy:
+
+```bash
+npx hardhat run scripts/deploy.js --network sepolia
+```
+
+The deployment script prints the addresses of the deployed contracts. These addresses are needed by the backend.
+
+### Getting a Sepolia RPC URL
+
+You can use a provider such as [Alchemy](https://www.alchemy.com/?utm_source=chatgpt.com) or [Infura](https://www.infura.io/?utm_source=chatgpt.com).
+
+For testing, use a **separate wallet** containing only testnet funds. Never put the private key of a wallet containing real assets into `.env`.
+
+Sepolia ETH can be obtained from a Sepolia faucet.
+
+> The contracts were also tested in a sandboxed environment where direct Solidity compiler downloads were unavailable. In that environment I used the `solc` npm package and ran Hardhat with `--no-compile`. On a normal machine, the standard Hardhat commands above should work.
+
+---
+
+# 2. Backend
+
+The backend is a **Spring Boot application using Web3j**.
+
+After deploying the contracts, configure the following environment variables:
+
+```bash
+export WEB3_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+export TOKEN_ADDRESS=0x...
+export STAKING_ADDRESS=0x...
+export WATCHED_WALLETS=0xYourTestWallet
+```
+
+Then start the application:
+
+```bash
+cd backend
+mvn spring-boot:run
+```
+
+The application runs on:
+
+```text
+http://localhost:8080
+```
+
+## REST API
+
+| Method | Endpoint                                  | Description                              |
+| ------ | ----------------------------------------- | ---------------------------------------- |
+| GET    | `/api/wallets/{address}`                  | Get the latest cached snapshot           |
+| POST   | `/api/wallets/{address}/refresh`          | Read the latest data from the blockchain |
+| GET    | `/api/wallets/{address}/history?limit=30` | Get historical snapshots                 |
+
+For example:
+
+```text
+GET /api/wallets/0x123...
+```
+
+returns the latest cached wallet information.
+
+To force a blockchain refresh:
+
+```text
+POST /api/wallets/0x123.../refresh
+```
+
+---
+
+## Reading Blockchain Data with Web3j
+
+One part of the backend I wanted to understand properly was how contract calls actually work underneath Web3j.
+
+Instead of using a generated contract wrapper, `ChainReaderService` builds the contract calls using Web3j's:
+
+```text
+FunctionEncoder
+FunctionReturnDecoder
+```
+
+This means the service explicitly handles the encoding of function calls and decoding of returned values.
+
+For the staking positions, the contract's mapping getter can be called directly:
+
+```text
+positions(address,uint256)
+```
+
+The Solidity compiler generates this getter for the mapping, so the backend can retrieve the individual fields without having to deal with a dynamic array of structs.
+
+It's a little more manual, but it makes the interaction with the contract ABI easier to understand.
+
+---
+
+# Snapshot Polling
+
+`SnapshotPollingService` periodically refreshes the wallets configured in `WATCHED_WALLETS`.
+
+The default polling interval is:
+
+```text
+60 seconds
+```
+
+The general flow is:
+
+```text
+Scheduler
+    ↓
+Read wallet data from Ethereum
+    ↓
+Create snapshot
+    ↓
+Store snapshot in database
+    ↓
+REST API reads cached data
+```
+
+This means most API requests don't need to make another RPC call.
+
+For a larger system, I wouldn't keep polling every wallet forever. A better approach would be to listen for contract events such as:
+
+```text
+Staked
+Withdrawn
+RewardsClaimed
+```
+
+and update the relevant wallet data when something actually changes.
+
+That's also one of the main areas I'd improve if I were taking this project further.
+
+---
+
+# Database
+
+The project uses **H2 by default**, so there is no database setup required for local development.
+
+For example:
+
+```text
+H2
+ ↓
+Snapshots
+ ↓
+REST API
+```
+
+PostgreSQL can also be used by changing the database configuration in `application.yml`.
+
+The database stores wallet snapshots so that the API can return historical data and the dashboard can display changes over time.
+
+---
+
+# 3. Dashboard
+
+The frontend is intentionally small.
+
+It's a single HTML/JavaScript page located at:
+
+```text
+backend/src/main/resources/static/index.html
+```
+
+There is no React application or separate frontend build process.
+
+Spring Boot serves the page directly.
+
+The dashboard lets you:
+
+* Enter a wallet address
+* Load the latest cached data
+* Force a blockchain refresh
+* View token balance
+* View total staked amount
+* View pending rewards
+* View individual staking positions
+* See lock period, APY, and position status
+* View historical snapshots
+
+The goal here wasn't to build a complicated UI. Most of the work in this project is in the **smart contracts and backend integration**.
+
+---
+
+# Running the Full Project
+
+### 1. Deploy the contracts
+
+```bash
+cd contracts
+
+npm install
+cp .env.example .env
+
 npx hardhat compile
 npx hardhat test
 npx hardhat run scripts/deploy.js --network sepolia
 ```
 
-- **`TrackerToken.sol`** — plain OpenZeppelin ERC-20, 1,000,000 initial supply.
-- **`Staking.sol`** — tiered-APY staking (30-day/5%, 90-day/12%, 180-day/25%), with a 10% early-exit
-  penalty for withdrawing before the lock expires and a `ReentrancyGuard` on every state-changing call.
-  This is the "stretch feature" version of a plain stake/unstake contract — worth being able to explain
-  the reward-math and penalty logic in an interview.
-- Tests cover: reward accrual over time, the early-exit penalty, full principal return after unlock,
-  and two revert paths (invalid lock tier, double withdrawal).
+Copy the deployed contract addresses.
 
-**Getting a free RPC URL:** sign up at [alchemy.com](https://alchemy.com) or [infura.io](https://infura.io),
-create a Sepolia app, copy the HTTPS URL. **Private key:** export it from a *throwaway* MetaMask wallet
-(Account details → Show private key) funded with free Sepolia ETH from a faucet like
-[sepoliafaucet.com](https://sepoliafaucet.com) — never use a wallet holding real funds.
-
-> **Note on this sandbox:** `npx hardhat compile` normally downloads the Solidity compiler from
-> `binaries.soliditylang.org`. This sandboxed session's network policy blocks that host, so the
-> contracts here were compiled with `node local-compile.js` (uses the `solc` npm package directly) and
-> tested with `npx hardhat test --no-compile`. On your own machine or in GitHub Actions, `npx hardhat
-> compile` will work normally — `local-compile.js` isn't needed there, it's just how this was verified
-> in this environment. All 5 tests pass.
-
-## 2. Backend
+### 2. Configure the backend
 
 ```bash
 cd backend
-# after deploying contracts, export the two addresses deploy.js prints:
-export WEB3_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
-export TOKEN_ADDRESS=0x...
-export STAKING_ADDRESS=0x...
-export WATCHED_WALLETS=0xYourTestWallet
+
+export WEB3_RPC_URL=...
+export TOKEN_ADDRESS=...
+export STAKING_ADDRESS=...
+export WATCHED_WALLETS=...
+```
+
+### 3. Start Spring Boot
+
+```bash
 mvn spring-boot:run
 ```
 
-Then open `http://localhost:8080`.
+### 4. Open the dashboard
 
-**Endpoints:**
+```text
+http://localhost:8080
+```
 
-| Method | Path | What it does |
-|---|---|---|
-| GET | `/api/wallets/{address}` | Latest cached snapshot (fast — reads the DB) |
-| POST | `/api/wallets/{address}/refresh` | Forces a live read from the chain, stores a new snapshot |
-| GET | `/api/wallets/{address}/history?limit=30` | Snapshot history for a "value over time" chart |
+---
 
-**How the Web3j layer works:** `ChainReaderService` encodes and decodes contract calls by hand with
-`FunctionEncoder`/`FunctionReturnDecoder` instead of using a generated contract wrapper (Web3j can
-generate one from an ABI via `web3j generate solidity`, but that's an extra build step). Reading a
-staking position uses the compiler's auto-generated flat getter for the `positions` mapping
-(`positions(address,uint256)` → six scalars) rather than decoding a dynamic array of structs, which is
-worth doing deliberately and simply rather than fighting ABI edge cases for a demo project.
+# What I Wanted to Learn From This
 
-`SnapshotPollingService` refreshes every watched wallet on a schedule (`web3.poll-interval-ms`,
-default 60s) so the API almost never has to make a live RPC call. Real production systems more often
-listen to contract *events* instead of polling every wallet — that's a natural "what would you do
-differently at scale" answer to have ready.
+This project was mainly about putting together the different pieces of a Web3 backend rather than just building a staking contract.
 
-Defaults to an in-memory H2 database (zero setup). To use Postgres instead, uncomment the Postgres
-block in `application.yml` and point it at a local instance.
+In particular, I wanted hands-on experience with:
 
-> **Note on this sandbox:** this session's network policy also blocks Maven Central
-> (`repo.maven.apache.org`), so `mvn compile` couldn't be run to verify the backend here. The code was
-> written and reviewed carefully, but **build it once on your own machine** (`mvn spring-boot:run`)
-> before relying on it — normal machines and CI have unrestricted access to Maven Central.
+* Solidity contract development
+* Ethereum RPC calls
+* Web3j
+* ABI encoding/decoding
+* Spring Boot REST APIs
+* Blockchain data caching
+* Scheduled background jobs
+* H2/PostgreSQL persistence
+* Contract event handling
+* Connecting on-chain data to a backend service
 
-## 3. Frontend
+It also gave me a chance to use my Java/backend experience in a Web3 project instead of relying entirely on a JavaScript frontend.
 
-A single dependency-free HTML/JS dashboard at `backend/src/main/resources/static/index.html`, served
-by Spring Boot itself — no separate build step. Enter a wallet address, hit "Load" (reads the cache) or
-"Force refresh" (reads the chain live), see balance, staked total, pending rewards, and a table of
-individual positions with their lock/APY/status.
+---
 
-## Suggested next steps if you want to go further
+# Possible Improvements
 
-- Swap polling for event-driven updates: subscribe to `Staked`/`Withdrawn`/`RewardsClaimed` logs with
-  Web3j's `web3j.ethLogFlowable(...)` and update snapshots reactively instead of on a timer.
-- Add a second protocol (e.g. track balances across two staking contracts) to show the backend
-  generalizes beyond one integration.
-- Deploy the backend somewhere public (Railway/Render free tier) so the link in your resume is live.
+There are a few directions I'd take this project next:
+
+* Replace polling with event-driven updates using Web3j
+* Track multiple staking protocols
+* Add more ERC-20 tokens
+* Add wallet-level portfolio valuation
+* Add authentication and user-managed wallets
+* Add PostgreSQL for a production deployment
+* Deploy the backend publicly
+* Add more contract integration tests
+* Add monitoring and error handling for RPC failures
+
+The current version is intentionally kept small enough that the entire flow — **Solidity → Ethereum → Web3j → Spring Boot → database → REST API → dashboard** — can be understood without too much abstraction.
